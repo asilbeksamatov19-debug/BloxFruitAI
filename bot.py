@@ -325,6 +325,18 @@ def _slugify(name: str):
     return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", name.lower())).strip("-")
 
 
+def _number_value(raw):
+    m = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*([KMBT])?\s*", str(raw), re.I)
+    if not m:
+        return 0.0
+    value = float(m.group(1))
+    multiplier = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}.get((m.group(2) or "").upper(), 1)
+    return value * multiplier
+
+def _split_items(raw: str) -> list[str]:
+    return [x.strip() for x in re.split(r"\s*(?:,|\+|&|\band\b)\s*", raw, flags=re.I) if x.strip()]
+
+
 def _extract_live_item(text, query, category, permanent=False):
     metadata_start = text.find(r'\"metadata\"')
     if metadata_start == -1:
@@ -402,6 +414,7 @@ async def get_live_value(query: str):
 
     aliases = {
         "dragon fruit": "dragon",
+        "leopard": "tiger",
     }
 
     candidate = aliases.get(clean_query.lower(), clean_query)
@@ -428,6 +441,38 @@ async def get_live_value(query: str):
     return None
 
 
+async def translate_to_uz(text: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return text
+
+    chunks = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= 450:
+            chunks.append(remaining)
+            break
+        cut = remaining.rfind(" ", 0, 450)
+        if cut < 100:
+            cut = 450
+        chunks.append(remaining[:cut].strip())
+        remaining = remaining[cut:].strip()
+
+    translated_chunks = []
+    for chunk in chunks:
+        try:
+            q = quote(chunk)
+            url = "https://api.mymemory.translated.net/get?q=" + q + "&langpair=en|uz"
+            raw = await _http_get(url, 15)
+            data = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+            translated = data.get("responseData", {}).get("translatedText", "").strip()
+            translated_chunks.append(translated or chunk)
+        except Exception as exc:
+            logging.warning("Translation failed: %s", exc)
+            translated_chunks.append(chunk)
+
+    return unescape(" ".join(translated_chunks))
+
 def _strip_html(value: str) -> str:
     value = re.sub(r"<script.*?</script>", " ", value, flags=re.I | re.S)
     value = re.sub(r"<style.*?</style>", " ", value, flags=re.I | re.S)
@@ -436,7 +481,7 @@ def _strip_html(value: str) -> str:
 
 async def _article_image(url: str) -> Optional[str]:
     try:
-        html = await asyncio.to_thread(_http_get, url, 10)
+        html = await _http_get(url, 10)
         for pattern in (
             r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
             r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image',
@@ -450,34 +495,39 @@ async def _article_image(url: str) -> Optional[str]:
 
 
 async def search_latest_news(query: str = "Blox Fruits latest update") -> list[dict]:
-    """Fresh RSS search. Results are dated and linked; no stale item is presented as current."""
-    rss_url = "https://news.google.com/rss/search?q=" + quote(query) + "&hl=en-US&gl=US&ceid=US:en"
+    """Fetch fresh news from the official Gamer Robot blog."""
     try:
-        raw = await asyncio.to_thread(_http_get, rss_url, 15)
-        root = ET.fromstring(raw)
+        raw = await _http_get("https://gamerrobot.com/blogs/news", 15)
+        paths = list(dict.fromkeys(re.findall(r"/blogs/news/[A-Za-z0-9_-]+", raw)))
+        paths = [x for x in paths if x != "/blogs/news/tagged"]
     except Exception as exc:
-        logging.warning("News fetch failed: %s", exc)
+        logging.warning("GamerRobot news index failed: %s", exc)
         return []
-
+    q = "" if query.lower() in {"blox fruits latest update", "blox fruits news"} else query.lower()
     items = []
-    for node in root.findall(".//item")[:8]:
-        title = node.findtext("title") or "Blox Fruits news"
-        link = node.findtext("link") or ""
-        pub = node.findtext("pubDate") or "Unknown"
-        description = _strip_html(node.findtext("description") or "")
-        source_node = node.find("source")
-        source = (source_node.text if source_node is not None else None) or link
-        image = await _article_image(link) if link else None
-        items.append({
-            "title": title,
-            "summary": description[:900],
-            "image": image,
-            "source": source,
-            "url": link,
-            "published_at": pub,
-        })
-    return items
-
+    for path in paths[:12]:
+        url = urljoin("https://gamerrobot.com", path)
+        try:
+            page = await _http_get(url, 15)
+            tm = re.search(r"<title[^>]*>(.*?)</title>", page, re.I | re.S)
+            title = _strip_html(unescape(tm.group(1))) if tm else path.rsplit("/", 1)[-1]
+            title = re.sub(r"\s*[–-]\s*Blox Fruits\s*$", "", title, flags=re.I).strip()
+            clean = _strip_html(page)
+            if q and q not in title.lower() and q not in clean.lower():
+                continue
+            dm = re.search(r"<time[^>]*>(.*?)</time>", page, re.I | re.S)
+            published_at = _strip_html(dm.group(1)) if dm else "N/A"
+            im = re.search(r"<meta[^>]+property=[" + chr(34) + chr(39) + r"]og:image[" + chr(34) + chr(39) + r"][^>]+content=[" + chr(34) + chr(39) + r"]([^" + chr(34) + chr(39) + r"]+)", page, re.I)
+            image = urljoin(url, unescape(im.group(1))) if im else None
+            page_content = re.sub(r"<script\b[^>]*>.*?</script>", " ", page, flags=re.I | re.S)
+            page_content = re.sub(r"<style\b[^>]*>.*?</style>", " ", page_content, flags=re.I | re.S)
+            paragraphs = re.findall(r"<(?:p|h2|h3)[^>]*>(.*?)</(?:p|h2|h3)>", page_content, re.I | re.S)
+            parts = [_strip_html(unescape(x)) for x in paragraphs]
+            parts = [x for x in parts if x]
+            items.append({"title": title, "summary": " ".join(parts[:8])[:900], "image": image, "source": "Gamer Robot", "url": url, "published_at": published_at})
+        except Exception as exc:
+            logging.warning("GamerRobot article failed %s: %s", url, exc)
+    return items[:8]
 
 
 async def calculate_trade(give_items: str, want_items: str) -> str:
@@ -1038,9 +1088,11 @@ async def news_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     for item in items[:5]:
+        title_uz = await translate_to_uz(item.get("title", "Blox Fruits Update"))
+        summary_uz = await translate_to_uz(item.get("summary", ""))
         text = (
-            f"🆕 {item.get('title', 'Blox Fruits Update')}\n\n"
-            f"{item.get('summary', '')}\n\n"
+            f"🆕 {title_uz}\n\n"
+            f"{summary_uz}\n\n"
             f"🕐 {item.get('published_at', 'N/A')}\n"
             f"📰 {item.get('source', 'N/A')}\n"
             f"🔗 {item.get('url', '')}"
@@ -1055,36 +1107,228 @@ async def news_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await update.effective_message.reply_text(text)
 
 
+async def fetch_latest_update() -> dict | None:
+    """Fetch the newest numbered update from the Blox Fruits Fandom API."""
+    api = "https://blox-fruits.fandom.com/api.php"
+    try:
+        list_url = api + "?action=query&list=allpages&apprefix=Updates/&aplimit=100&format=json"
+        raw = await _http_get(list_url, 15)
+        data = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+        pages = data.get("query", {}).get("allpages", [])
+        numbers = []
+        for page in pages:
+            m = re.search(r"^Updates/(\d+)$", page.get("title", ""))
+            if m:
+                numbers.append(int(m.group(1)))
+        if not numbers:
+            return None
+
+        latest = max(numbers)
+        title = f"Updates/{latest}"
+        rev_url = api + "?action=query&prop=revisions&rvprop=content&rvslots=main&titles=" + quote(title) + "&format=json"
+        raw_rev = await _http_get(rev_url, 15)
+        rev_data = json.loads(raw_rev.decode("utf-8") if isinstance(raw_rev, bytes) else raw_rev)
+        pages_data = rev_data.get("query", {}).get("pages", {})
+        page = next(iter(pages_data.values()), {})
+        revisions = page.get("revisions", [])
+        if not revisions:
+            return None
+        content = revisions[0].get("slots", {}).get("main", {}).get("*", "")
+
+        def field(name: str) -> str:
+            m = re.search(r"\|\s*" + re.escape(name) + r"\s*=\s*([^\n|]+)", content, re.I)
+            return _strip_html(m.group(1)).strip() if m else ""
+
+        name = field("name") or f"Update {latest}"
+        release = field("release") or "N/A"
+        desc = field("desc") or ""
+
+        lines = []
+        for line in content.splitlines():
+            line = line.strip()
+            if not line or line.startswith("{|") or line.startswith("|}") or line.startswith("|-"):
+                continue
+            if line.startswith("|") and "=" in line:
+                continue
+            if line.startswith("*"):
+                line = re.sub(r"^\*+\s*", "• ", line)
+                line = re.sub(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]", lambda m: m.group(2) or m.group(1), line)
+                line = re.sub(r"\{\{[^{}]+\}\}", "", line)
+                line = re.sub(r"\[\d+\]", "", line)
+                line = re.sub(r"\s+", " ", line).strip()
+                if line:
+                    lines.append(line)
+
+        summary = "\n".join(lines[:12])
+        url = f"https://blox-fruits.fandom.com/wiki/{quote(title.replace(' ', '_'))}"
+        return {"number": latest, "name": name, "release": release, "desc": desc, "summary": summary, "url": url}
+    except Exception as exc:
+        logging.warning("Fandom update fetch failed: %s", exc)
+        return None
+
+
 async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await news_command(update, context)
+    await update.effective_message.reply_text("🔄 Eng yangi Blox Fruits update tekshirilmoqda...")
+    item = await fetch_latest_update()
+    if not item:
+        await update.effective_message.reply_text("⚠️ Fandom Wiki'dan update ma'lumotini olib bo'lmadi.")
+        return
+    name_uz = await translate_to_uz(item["name"])
+    release_uz = await translate_to_uz(item["release"])
+    desc_uz = await translate_to_uz(item["desc"])
+    summary_uz = await translate_to_uz(item["summary"])
+    text = (
+        f"🆕 Blox Fruits Update #{item['number']}\n"
+        f"📌 {name_uz}\n"
+        f"📅 {release_uz}\n\n"
+        f"{desc_uz}\n\n"
+        f"{summary_uz}\n\n"
+        f"🔗 Fandom Wiki: {item['url']}"
+    )
+    await update.effective_message.reply_text(text[:4096])
+
+
+async def search_wiki_item(query: str) -> Optional[dict]:
+    api = "https://blox-fruits.fandom.com/api.php"
+    search_url = api + "?action=query&list=search&srsearch=" + quote(query) + "&srlimit=5&format=json"
+
+    try:
+        data = json.loads(await _http_get(search_url, 15))
+        results = data.get("query", {}).get("search", [])
+        if not results:
+            return None
+
+        title = next(
+            (x.get("title", "") for x in results
+             if x.get("title", "").lower() == query.lower()),
+            results[0].get("title", ""),
+        )
+        if not title:
+            return None
+
+        page_url = "https://blox-fruits.fandom.com/wiki/" + quote(title.replace(" ", "_"))
+        content_url = (
+            api + "?action=query&prop=revisions&rvprop=content"
+            "&rvslots=main&titles=" + quote(title) + "&format=json"
+        )
+
+        raw = json.loads(await _http_get(content_url, 15))
+        pages = raw.get("query", {}).get("pages", {})
+        page = next(iter(pages.values()), {})
+        revisions = page.get("revisions", [])
+
+        if not revisions:
+            return {"title": title, "url": page_url}
+
+        content = revisions[0].get("slots", {}).get("main", {}).get("*", "")
+
+        def clean(value: str) -> str:
+            value = re.sub(r"<!--.*?-->", " ", value, flags=re.S)
+            value = re.sub(r"<[^>]+>", " ", value)
+            value = re.sub(r"\{\{[^{}]*\}\}", " ", value)
+            value = re.sub(r"\[\[([^|\]]+)\|([^\]]+)\]\]", r"\2", value)
+            value = re.sub(r"\[\[([^\]]+)\]\]", r"\1", value)
+            value = re.sub(r"\[https?://[^ ]+ ([^\]]+)\]", r"\1", value)
+            value = re.sub(r"'''?", "", value)
+            value = re.sub(r"^\s*[-*#;:]+\s*", "", value, flags=re.M)
+            return re.sub(r"\s+", " ", unescape(value)).strip()
+
+        def field(name: str) -> str:
+            pattern = r"^\s*\|\s*" + re.escape(name) + r"\s*=\s*(.*?)\s*$"
+            match = re.search(pattern, content, flags=re.I | re.M)
+            return clean(match.group(1)) if match else ""
+
+        def section(name: str) -> str:
+            pattern = r"^==+\s*" + re.escape(name) + r"\s*==+\s*$"
+            match = re.search(pattern, content, flags=re.I | re.M)
+            if not match:
+                return ""
+
+            rest = content[match.end():]
+            next_section = re.search(
+                r"^==+\s*[^=].*?\s*==+\s*$",
+                rest,
+                flags=re.M,
+            )
+            text = rest[:next_section.start()] if next_section else rest
+            return clean(text)
+
+        return {
+            "title": title,
+            "url": page_url,
+            "rarity": field("rarity"),
+            "type": field("type"),
+            "sea": field("sea"),
+            "location": field("location"),
+            "obtain": field("obtain"),
+            "source": field("source"),
+            "price": field("price") or field("cost"),
+            "buffs": field("buffs"),
+            "obtainment": section("Obtainment"),
+            "requirements": section("Requirements"),
+            "overview": section("Overview"),
+            "description": section("Description"),
+        }
+
+    except Exception as exc:
+        logging.warning("Wiki search failed: %s", exc)
+        return None
 
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = " ".join(context.args).strip()
+
     if not query:
         await update.effective_message.reply_text(
-            "🔎 Foydalanish:\n/search Dragon rework"
+            "🔎 Foydalanish:\n/search Coat"
         )
         return
 
     await update.effective_message.reply_text(
-        f"🔎 Eng yangi ma'lumot qidirilmoqda: {query}"
+        f"🔎 Blox Fruits Wiki qidirilmoqda: {query}"
     )
 
-    items = await search_latest_news(query)
-    if not items:
+    item = await search_wiki_item(query)
+
+    if not item:
         await update.effective_message.reply_text(
-            "⚠️ Fresh search engine hali ulanmagan."
+            f"❌ Wiki’da “{query}” bo‘yicha ma’lumot topilmadi."
         )
         return
 
-    for item in items[:5]:
-        await update.effective_message.reply_text(
-            f"🔎 {item.get('title', 'Result')}\n\n"
-            f"{item.get('summary', '')}\n\n"
-            f"🕐 {item.get('published_at', 'N/A')}"
-        )
+    lines = [f"📖 {item.get('title', query)}"]
 
+    fields = (
+        ("rarity", "⭐ Rarity"),
+        ("type", "🏷 Type"),
+        ("sea", "🌊 Sea"),
+        ("location", "📍 Location"),
+        ("price", "💰 Price"),
+        ("obtain", "🎯 Obtain"),
+        ("source", "👤 Source"),
+        ("buffs", "⚡ Buffs"),
+    )
+
+    for key, label in fields:
+        value = item.get(key, "")
+        if value:
+            lines.append(f"{label}: {value}")
+
+    if item.get("obtainment"):
+        lines.append(f"\n📌 Olish usuli:\n{item['obtainment']}")
+
+    if item.get("requirements"):
+        lines.append(f"\n📋 Talablar:\n{item['requirements']}")
+
+    info = item.get("overview") or item.get("description")
+    if info:
+        lines.append(f"\nℹ️ Qo‘shimcha:\n{info}")
+
+    text = "\n".join(lines)
+    text = await translate_to_uz(text)
+    text += f"\n\n🔗 Wiki: {item['url']}"
+
+    await update.effective_message.reply_text(text[:4000])
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
