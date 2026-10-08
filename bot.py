@@ -1,0 +1,1283 @@
+import os
+import sqlite3
+import logging
+import asyncio
+import json
+import re
+from html import unescape
+from html.parser import HTMLParser
+from urllib.parse import quote, urljoin
+from urllib.request import Request, urlopen
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from typing import Optional
+
+from dotenv import load_dotenv
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+)
+from telegram.constants import ChatType
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+# ============================================================
+# BloxFruitAI
+# Main bot foundation
+# Tokens/API keys are intentionally loaded from .env
+# ============================================================
+
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_BOT_TOKEN_HERE")
+OWNER_ID_RAW = os.getenv("OWNER_ID", "0")
+AI_API_KEY = os.getenv("AI_API_KEY", "")
+DB_PATH = os.getenv("DB_PATH", "bloxfruitai.db")
+
+try:
+    OWNER_ID = int(OWNER_ID_RAW)
+except ValueError:
+    OWNER_ID = 0
+
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("BloxFruitAI")
+
+# Per-user temporary UI/session state.
+# Persistent important data belongs in SQLite.
+user_sessions: dict[int, dict] = {}
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    conn = db()
+    cur = conn.cursor()
+
+    cur.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            xp INTEGER NOT NULL DEFAULT 0,
+            reputation INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS groups (
+            chat_id INTEGER PRIMARY KEY,
+            title TEXT,
+            chat_type TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            ai_enabled INTEGER NOT NULL DEFAULT 1,
+            trade_enabled INTEGER NOT NULL DEFAULT 1,
+            news_enabled INTEGER NOT NULL DEFAULT 1,
+            marketplace_enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER NOT NULL,
+            chat_id INTEGER,
+            give_items TEXT NOT NULL,
+            want_items TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            created_at TEXT NOT NULL,
+            expires_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS offers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_id INTEGER NOT NULL,
+            from_user_id INTEGER NOT NULL,
+            give_items TEXT NOT NULL,
+            want_items TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            action TEXT NOT NULL,
+            details TEXT,
+            created_at TEXT NOT NULL
+        );
+        """
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def register_user(user) -> None:
+    if not user:
+        return
+    conn = db()
+    conn.execute(
+        """
+        INSERT INTO users(user_id, username, first_name, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username=excluded.username,
+            first_name=excluded.first_name,
+            updated_at=excluded.updated_at
+        """,
+        (user.id, user.username or "", user.first_name or "", now(), now()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def register_group(chat) -> None:
+    if not chat or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    conn = db()
+    conn.execute(
+        """
+        INSERT INTO groups(chat_id, title, chat_type, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(chat_id) DO UPDATE SET
+            title=excluded.title,
+            chat_type=excluded.chat_type,
+            updated_at=excluded.updated_at
+        """,
+        (chat.id, chat.title or "", chat.type, now(), now()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def log_action(user_id: Optional[int], action: str, details: str = "") -> None:
+    conn = db()
+    conn.execute(
+        "INSERT INTO audit_logs(user_id, action, details, created_at) VALUES (?, ?, ?, ?)",
+        (user_id, action, details, now()),
+    )
+    conn.commit()
+    conn.close()
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def is_owner(user_id: int) -> bool:
+    return OWNER_ID != 0 and user_id == OWNER_ID
+
+
+async def is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if not chat or not user:
+        return False
+
+    if is_owner(user.id):
+        return True
+
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return False
+
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        logger.exception("Could not check group admin")
+        return False
+
+
+def group_settings(chat_id: int) -> dict:
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM groups WHERE chat_id = ?", (chat_id,)
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return {
+            "enabled": 1,
+            "ai_enabled": 1,
+            "trade_enabled": 1,
+            "news_enabled": 1,
+            "marketplace_enabled": 1,
+        }
+
+    return dict(row)
+
+
+async def send_menu(update: Update, text: str) -> None:
+    keyboard = [
+        [
+            InlineKeyboardButton("📊 Values", callback_data="menu_values"),
+            InlineKeyboardButton("🔄 Trade", callback_data="menu_trade"),
+        ],
+        [
+            InlineKeyboardButton("🤝 Marketplace", callback_data="menu_market"),
+            InlineKeyboardButton("📰 News", callback_data="menu_news"),
+        ],
+        [
+            InlineKeyboardButton("🤖 AI", callback_data="menu_ai"),
+            InlineKeyboardButton("👤 Profile", callback_data="menu_profile"),
+        ],
+        [
+            InlineKeyboardButton("❓ Help", callback_data="menu_help"),
+        ],
+    ]
+    markup = InlineKeyboardMarkup(keyboard)
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=markup)
+    else:
+        await update.effective_message.reply_text(text, reply_markup=markup)
+
+
+# ============================================================
+# PLACEHOLDER DATA SERVICES
+# These are deliberately isolated so real APIs/scrapers can be
+# connected later without rewriting handlers.
+# ============================================================
+
+async def _http_get(url: str, timeout: int = 12) -> str:
+    req = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Android) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/130 Mobile Safari/537.36"
+        },
+    )
+    with urlopen(req, timeout=timeout) as response:
+        return response.read().decode("utf-8", errors="ignore")
+
+
+class _TextParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+    def handle_data(self, data):
+        if data.strip():
+            self.parts.append(data.strip())
+    def text(self):
+        return re.sub(r"\s+", " ", unescape(" ".join(self.parts))).strip()
+
+
+def _page_text(html: str) -> str:
+    parser = _TextParser()
+    parser.feed(html)
+    return parser.text()
+
+
+def _parse_value(raw: str):
+    m = re.search(r"\b(\d+(?:\.\d+)?)([KMBT])\b", raw, re.I)
+    if not m:
+        return None
+    return f"{m.group(1)}{m.group(2).upper()}"
+
+
+def _slugify(name: str) -> str:
+    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", name.lower())).strip("-")
+
+
+def _extract_live_item(text: str, query: str, category: str):
+    q = query.lower().strip()
+    pos = text.lower().find(q)
+    window = text[max(0, pos - 250):pos + 1800] if pos >= 0 else text[:5000]
+
+    value = None
+    for label in ("Regular value", "Value"):
+        m = re.search(re.escape(label) + r"\s+(\d+(?:\.\d+)?[KMBT])", window, re.I)
+        if m:
+            value = m.group(1)
+            break
+
+    demand = None
+    m = re.search(r"Demand\s+(\d+(?:\.\d+)?)/10", window, re.I)
+    if m:
+        demand = float(m.group(1))
+
+    trend = "Unknown"
+    for candidate in ("Stable", "Overpaid", "Underpaid", "Fluctuating", "Unstable"):
+        if re.search(r"\b" + re.escape(candidate) + r"\b", window, re.I):
+            trend = candidate
+            break
+
+    updated = "Unknown"
+    m = re.search(r"(?:Last updated|Updated)\s+(.{1,45}?)(?:Price history|$)", window, re.I)
+    if m:
+        updated = re.sub(r"\s+", " ", m.group(1)).strip()
+
+    if not value:
+        return None
+    return {
+        "name": query,
+        "value": value,
+        "demand": demand if demand is not None else "N/A",
+        "trend": trend,
+        "updated_at": updated,
+        "category": category,
+        "source": "https://bloxfruitsvalues.com/",
+    }
+
+
+async def get_live_value(query: str) -> Optional[dict]:
+    """Fetch a fresh item page from Blox Fruits Values; never invent values."""
+    query = query.strip()
+    if not query:
+        return None
+
+    categories = ("fruits", "gamepasses", "limiteds")
+    slug = _slugify(query)
+
+    for category in categories:
+        urls = [
+            f"https://bloxfruitsvalues.com/values/{category}/{slug}",
+            f"https://bloxfruitsvalues.com/values/{category}",
+        ]
+        for url in urls:
+            try:
+                html = await asyncio.to_thread(_http_get, url)
+                text = _page_text(html)
+                if query.lower() in text.lower():
+                    result = _extract_live_item(text, query, category)
+                    if result:
+                        return result
+            except Exception as exc:
+                logging.debug("Value fetch failed %s: %s", url, exc)
+    return None
+
+
+def _strip_html(value: str) -> str:
+    value = re.sub(r"<script.*?</script>", " ", value, flags=re.I | re.S)
+    value = re.sub(r"<style.*?</style>", " ", value, flags=re.I | re.S)
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", unescape(value))).strip()
+
+
+async def _article_image(url: str) -> Optional[str]:
+    try:
+        html = await asyncio.to_thread(_http_get, url, 10)
+        for pattern in (
+            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)',
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image',
+        ):
+            m = re.search(pattern, html, re.I)
+            if m:
+                return urljoin(url, unescape(m.group(1)))
+    except Exception:
+        pass
+    return None
+
+
+async def search_latest_news(query: str = "Blox Fruits latest update") -> list[dict]:
+    """Fresh RSS search. Results are dated and linked; no stale item is presented as current."""
+    rss_url = "https://news.google.com/rss/search?q=" + quote(query) + "&hl=en-US&gl=US&ceid=US:en"
+    try:
+        raw = await asyncio.to_thread(_http_get, rss_url, 15)
+        root = ET.fromstring(raw)
+    except Exception as exc:
+        logging.warning("News fetch failed: %s", exc)
+        return []
+
+    items = []
+    for node in root.findall(".//item")[:8]:
+        title = node.findtext("title") or "Blox Fruits news"
+        link = node.findtext("link") or ""
+        pub = node.findtext("pubDate") or "Unknown"
+        description = _strip_html(node.findtext("description") or "")
+        source_node = node.find("source")
+        source = (source_node.text if source_node is not None else None) or link
+        image = await _article_image(link) if link else None
+        items.append({
+            "title": title,
+            "summary": description[:900],
+            "image": image,
+            "source": source,
+            "url": link,
+            "published_at": pub,
+        })
+    return items
+
+
+async def ask_blox_ai(question: str) -> str:
+    """Use an OpenAI-compatible API when AI_API_KEY is supplied."""
+    if not AI_API_KEY:
+        return (
+            "🤖 AI_API_KEY hali qo'yilmagan.\n\n"
+            ".env ichiga AI_API_KEY qo'yilgach /ai ishlaydi."
+        )
+
+    api_url = os.getenv("AI_API_URL", "https://api.openai.com/v1/chat/completions")
+    model = os.getenv("AI_MODEL", "gpt-4o-mini")
+    system = (
+        "You are BloxFruitAI. Answer in Uzbek unless the user asks otherwise. "
+        "Help with Blox Fruits values, trading, builds and game mechanics. "
+        "Never claim a live value/news fact is current unless supplied by fresh data. "
+        "Be concise and warn that actual Roblox trades happen in-game."
+    )
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": question},
+        ],
+        "temperature": 0.3,
+    }
+    try:
+        def call():
+            req = Request(
+                api_url,
+                data=json.dumps(payload).encode(),
+                headers={
+                    "Authorization": f"Bearer {AI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with urlopen(req, timeout=30) as response:
+                return json.loads(response.read().decode())
+        data = await asyncio.to_thread(call)
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as exc:
+        logging.exception("AI request failed")
+        return f"⚠️ AI so'rovini bajarib bo'lmadi: {type(exc).__name__}"
+
+
+def _split_items(raw: str) -> list[str]:
+    return [x.strip() for x in re.split(r"\s*(?:\+|,|;)\s*", raw) if x.strip()]
+
+
+def _number_value(value: str) -> float:
+    m = re.match(r"(\d+(?:\.\d+)?)([KMBT])?$", value.strip(), re.I)
+    if not m:
+        return 0.0
+    n = float(m.group(1))
+    return n * {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}.get((m.group(2) or "").upper(), 1)
+
+
+async def calculate_trade(give_items: str, want_items: str) -> str:
+    async def resolve(raw):
+        results = []
+        for item in _split_items(raw):
+            r = await get_live_value(item)
+            if r:
+                results.append(r)
+            else:
+                results.append({"name": item, "value": None, "demand": "N/A"})
+        return results
+
+    give = await resolve(give_items)
+    want = await resolve(want_items)
+    unknown = [x["name"] for x in give + want if not x.get("value")]
+    if unknown:
+        return (
+            "⚠️ Quyidagi item(lar) live manbadan topilmadi:\n"
+            + "\n".join(f"• {x}" for x in unknown)
+            + "\n\nNomini aniqroq yozing."
+        )
+
+    give_total = sum(_number_value(x["value"]) for x in give)
+    want_total = sum(_number_value(x["value"]) for x in want)
+    diff = want_total - give_total
+    pct = (diff / give_total * 100) if give_total else 0
+    if abs(pct) <= 5:
+        verdict = "🟢 FAIR"
+    elif pct > 0:
+        verdict = "🔵 W (siz uchun)"
+    else:
+        verdict = "🔴 L (siz uchun)"
+
+    def lines(items):
+        return "\n".join(f"• {x['name']}: {x['value']} | Demand {x['demand']}/10" for x in items)
+
+    return (
+        "🔄 TRADE CALCULATOR\n\n"
+        f"📤 SIZ BERASIZ:\n{lines(give)}\n"
+        f"💰 Jami: {give_total:,.0f}\n\n"
+        f"📥 SIZ OLASIZ:\n{lines(want)}\n"
+        f"💰 Jami: {want_total:,.0f}\n\n"
+        f"📊 Farq: {abs(diff):,.0f} ({abs(pct):.1f}%)\n"
+        f"🏷️ Natija: {verdict}\n\n"
+        "⚠️ Demand va real tradeability ham muhim. Robloxdagi transferni o'yinning o'zida bajarasiz."
+    )
+
+
+# ============================================================
+# COMMANDS
+# ============================================================
+
+HELP_TEXT = """
+🤖 BloxFruitAI — Yordam
+
+📊 VALUES
+/value <item> — item value
+/values — value tizimi
+/search <savol> — Blox Fruits ma'lumotini qidirish
+
+🔄 TRADING
+/trade — Trade Calculator
+/offer — Offer yaratish
+/trades — Marketplace
+/profile — Profil
+
+📰 NEWS
+/news — Eng yangi Blox Fruits yangiliklari
+/update — Eng so'nggi update
+
+🤖 AI
+/ai <savol> — Blox Fruits AI
+
+👑 ADMIN
+/admin — Owner/Group Admin Panel
+
+ℹ️ Barcha asosiy funksiyalar / commandlar orqali ishlaydi.
+Tugmalar orqali ham boshqarish mumkin.
+"""
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    chat = update.effective_chat
+
+    register_user(user)
+    register_group(chat)
+
+    text = (
+        "🤖 BloxFruitAI'ga xush kelibsiz!\n\n"
+        "🍎 Live Values\n"
+        "🔄 Trade Calculator\n"
+        "🤝 Offers & Marketplace\n"
+        "📰 Live Blox Fruits News\n"
+        "🧠 Blox Fruits AI\n\n"
+        "Boshlash uchun /help ni bosing."
+    )
+    await send_menu(update, text)
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    register_user(update.effective_user)
+    register_group(update.effective_chat)
+    await update.effective_message.reply_text(HELP_TEXT)
+
+
+async def value_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    register_user(update.effective_user)
+    register_group(update.effective_chat)
+
+    query = " ".join(context.args).strip()
+    if not query:
+        await update.effective_message.reply_text(
+            "📊 Foydalanish:\n/value Dragon\n\n"
+            "Item nomini yozing."
+        )
+        return
+
+    await update.effective_message.reply_text(
+        f"🔎 {query} uchun eng yangi value tekshirilmoqda..."
+    )
+
+    result = await get_live_value(query)
+    if not result:
+        await update.effective_message.reply_text(
+            "⚠️ Hozircha live value manbasi ulanmagan.\n"
+            "Eski yoki taxminiy value'ni current deb ko'rsatmayman."
+        )
+        return
+
+    await update.effective_message.reply_text(
+        f"📊 {result.get('name', query)}\n"
+        f"💰 Value: {result.get('value', 'N/A')}\n"
+        f"🔥 Demand: {result.get('demand', 'N/A')}\n"
+        f"📈 Trend: {result.get('trend', 'N/A')}\n"
+        f"🕐 Updated: {result.get('updated_at', 'N/A')}"
+    )
+
+
+async def values_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(
+        "📊 Values bo'limi\n\n"
+        "🍎 Fruits\n"
+        "♾️ Perm Fruits\n"
+        "🎟️ Gamepasses\n"
+        "💎 Limiteds / Skins\n\n"
+        "Live source ulanishi bilan qiymatlar avtomatik yangilanadi."
+    )
+
+
+async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    register_user(update.effective_user)
+    register_group(update.effective_chat)
+
+    if context.args:
+        raw = " ".join(context.args)
+        if "|" in raw:
+            give, want = [x.strip() for x in raw.split("|", 1)]
+            result = await calculate_trade(give, want)
+            await update.effective_message.reply_text(result)
+            return
+
+    user_sessions[update.effective_user.id] = {
+        "mode": "trade",
+        "step": "give",
+        "give": "",
+        "want": "",
+    }
+
+    await update.effective_message.reply_text(
+        "🔄 Trade yaratish\n\n"
+        "1️⃣ Siz beradigan itemlarni yozing.\n"
+        "Masalan: Dragon + Buddha\n\n"
+        "Keyin sizdan olmoqchi bo'lgan itemlaringizni so'rayman.\n\n"
+        "❌ Bekor qilish: /cancel"
+    )
+
+
+async def offer_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(
+        "🤝 Offer tizimi\n\n"
+        "Offer yuborish uchun avval /trades orqali ochiq trade tanlang.\n"
+        "Keyingi bosqichda Accept ✅ / Counter Offer 🔄 / Decline ❌ tizimi ishlaydi."
+    )
+
+
+async def trades_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    conn = db()
+    rows = conn.execute(
+        """
+        SELECT id, owner_id, give_items, want_items, created_at
+        FROM trades
+        WHERE status='open'
+        ORDER BY id DESC
+        LIMIT 10
+        """
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        await update.effective_message.reply_text(
+            "🛒 Hozircha ochiq trade'lar yo'q."
+        )
+        return
+
+    lines = ["🛒 Ochiq Trade'lar:\n"]
+    for row in rows:
+        lines.append(
+            f"#{row['id']} | 📤 {row['give_items']} → 📥 {row['want_items']}"
+        )
+
+    await update.effective_message.reply_text("\n".join(lines))
+
+
+async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    register_user(user)
+
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM users WHERE user_id=?", (user.id,)
+    ).fetchone()
+    trade_count = conn.execute(
+        "SELECT COUNT(*) FROM trades WHERE owner_id=?", (user.id,)
+    ).fetchone()[0]
+    conn.close()
+
+    await update.effective_message.reply_text(
+        "👤 Profil\n\n"
+        f"🆔 ID: {user.id}\n"
+        f"👤 Username: @{user.username}" if user.username else
+        f"👤 Profil\n\n🆔 ID: {user.id}"
+    )
+
+    # Send stats separately so conditional formatting stays simple.
+    await update.effective_message.reply_text(
+        f"⭐ XP: {row['xp']}\n"
+        f"🏆 Reputation: {row['reputation']}\n"
+        f"🔄 Created trades: {trade_count}"
+    )
+
+
+async def news_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(
+        "📰 Eng yangi Blox Fruits yangiliklari tekshirilmoqda..."
+    )
+
+    items = await search_latest_news()
+    if not items:
+        await update.effective_message.reply_text(
+            "⚠️ Hozircha live news engine ulanmagan.\n"
+            "Eski news'ni yangi deb ko'rsatmayman."
+        )
+        return
+
+    for item in items[:5]:
+        text = (
+            f"🆕 {item.get('title', 'Blox Fruits Update')}\n\n"
+            f"{item.get('summary', '')}\n\n"
+            f"🕐 {item.get('published_at', 'N/A')}\n"
+            f"📰 {item.get('source', 'N/A')}\n"
+            f"🔗 {item.get('url', '')}"
+        )
+        image = item.get("image")
+        try:
+            if image:
+                await update.effective_message.reply_photo(photo=image, caption=text[:1024])
+            else:
+                await update.effective_message.reply_text(text)
+        except Exception:
+            await update.effective_message.reply_text(text)
+
+
+async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await news_command(update, context)
+
+
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = " ".join(context.args).strip()
+    if not query:
+        await update.effective_message.reply_text(
+            "🔎 Foydalanish:\n/search Dragon rework"
+        )
+        return
+
+    await update.effective_message.reply_text(
+        f"🔎 Eng yangi ma'lumot qidirilmoqda: {query}"
+    )
+
+    items = await search_latest_news(query)
+    if not items:
+        await update.effective_message.reply_text(
+            "⚠️ Fresh search engine hali ulanmagan."
+        )
+        return
+
+    for item in items[:5]:
+        await update.effective_message.reply_text(
+            f"🔎 {item.get('title', 'Result')}\n\n"
+            f"{item.get('summary', '')}\n\n"
+            f"🕐 {item.get('published_at', 'N/A')}"
+        )
+
+
+async def ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    question = " ".join(context.args).strip()
+    if not question:
+        await update.effective_message.reply_text(
+            "🤖 Foydalanish:\n/ai Dragon uchun best build?"
+        )
+        return
+
+    answer = await ask_blox_ai(question)
+    await update.effective_message.reply_text(answer)
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_sessions.pop(update.effective_user.id, None)
+    await update.effective_message.reply_text("❌ Joriy amal bekor qilindi.")
+
+
+# ============================================================
+# ADMIN PANEL
+# ============================================================
+
+def owner_panel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("👥 Groups", callback_data="owner_groups"),
+                InlineKeyboardButton("📊 Stats", callback_data="owner_stats"),
+            ],
+            [
+                InlineKeyboardButton("🔄 Value Sync", callback_data="owner_sync"),
+                InlineKeyboardButton("📰 News", callback_data="owner_news"),
+            ],
+            [
+                InlineKeyboardButton("🤖 AI", callback_data="owner_ai"),
+                InlineKeyboardButton("🛡️ Logs", callback_data="owner_logs"),
+            ],
+            [
+                InlineKeyboardButton("⚙️ Settings", callback_data="owner_settings"),
+            ],
+        ]
+    )
+
+
+def group_panel_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🤖 AI", callback_data=f"grp_ai:{chat_id}"),
+                InlineKeyboardButton("🔄 Trade", callback_data=f"grp_trade:{chat_id}"),
+            ],
+            [
+                InlineKeyboardButton("📰 News", callback_data=f"grp_news:{chat_id}"),
+                InlineKeyboardButton("🛒 Market", callback_data=f"grp_market:{chat_id}"),
+            ],
+            [
+                InlineKeyboardButton("🔌 Bot ON/OFF", callback_data=f"grp_bot:{chat_id}"),
+            ],
+            [
+                InlineKeyboardButton("⬅️ Back", callback_data="admin_back"),
+            ],
+        ]
+    )
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    chat = update.effective_chat
+
+    register_user(user)
+    register_group(chat)
+
+    if is_owner(user.id):
+        await update.effective_message.reply_text(
+            "👑 BloxFruitAI — Owner Panel\n\n"
+            "Bu panel orqali barcha guruhlar va global tizimlarni boshqarasiz.",
+            reply_markup=owner_panel_keyboard(),
+        )
+        return
+
+    if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        if not await is_group_admin(update, context):
+            await update.effective_message.reply_text(
+                "⛔ Bu panel faqat guruh adminlari uchun."
+            )
+            return
+
+        await update.effective_message.reply_text(
+            f"👮 {chat.title} — Group Admin Panel",
+            reply_markup=group_panel_keyboard(chat.id),
+        )
+        return
+
+    await update.effective_message.reply_text(
+        "⛔ Private chatda /admin faqat bot owneri uchun."
+    )
+
+
+# ============================================================
+# CALLBACKS
+# ============================================================
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    user = update.effective_user
+    data = query.data or ""
+
+    # General menu
+    if data == "menu_help":
+        await query.edit_message_text(HELP_TEXT)
+        return
+
+    if data == "menu_values":
+        await query.edit_message_text(
+            "📊 Values\n\n"
+            "/value <item> — aniq item value\n"
+            "/values — value bo'limi"
+        )
+        return
+
+    if data == "menu_trade":
+        await query.edit_message_text(
+            "🔄 Trade\n\n"
+            "/trade — bosqichma-bosqich trade\n"
+            "/trade Dragon + Buddha | Kitsune — tezkor hisob"
+        )
+        return
+
+    if data == "menu_market":
+        await query.edit_message_text(
+            "🛒 Marketplace\n\n/trades — ochiq trade'lar\n/offer — offer tizimi"
+        )
+        return
+
+    if data == "menu_news":
+        await query.edit_message_text(
+            "📰 News\n\n/news — eng yangi yangiliklar\n/update — update"
+        )
+        return
+
+    if data == "menu_ai":
+        await query.edit_message_text(
+            "🤖 AI\n\n/ai <savol> — Blox Fruits AI"
+        )
+        return
+
+    if data == "menu_profile":
+        await profile_command(update, context)
+        return
+
+    # Owner
+    if data == "admin_back":
+        await query.edit_message_text(
+            "👑 BloxFruitAI — Owner Panel",
+            reply_markup=owner_panel_keyboard(),
+        )
+        return
+
+    if data.startswith("owner_"):
+        if not is_owner(user.id):
+            await query.edit_message_text("⛔ Ruxsat yo'q.")
+            return
+
+        if data == "owner_groups":
+            conn = db()
+            rows = conn.execute(
+                "SELECT chat_id, title, chat_type, enabled FROM groups ORDER BY title"
+            ).fetchall()
+            conn.close()
+
+            if not rows:
+                await query.edit_message_text(
+                    "👥 Hali hech qanday guruh ro'yxatdan o'tmagan.",
+                    reply_markup=owner_panel_keyboard(),
+                )
+                return
+
+            buttons = []
+            for row in rows[:50]:
+                state = "🟢" if row["enabled"] else "🔴"
+                title = row["title"] or str(row["chat_id"])
+                buttons.append(
+                    [InlineKeyboardButton(
+                        f"{state} {title[:35]}",
+                        callback_data=f"owner_group:{row['chat_id']}"
+                    )]
+                )
+            buttons.append(
+                [InlineKeyboardButton("⬅️ Back", callback_data="admin_back")]
+            )
+            await query.edit_message_text(
+                "👥 Guruhlar:",
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+            return
+
+        if data == "owner_stats":
+            conn = db()
+            users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            groups = conn.execute("SELECT COUNT(*) FROM groups").fetchone()[0]
+            trades = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+            offers = conn.execute("SELECT COUNT(*) FROM offers").fetchone()[0]
+            conn.close()
+
+            await query.edit_message_text(
+                "📊 Global Statistics\n\n"
+                f"👤 Users: {users}\n"
+                f"👥 Groups: {groups}\n"
+                f"🔄 Trades: {trades}\n"
+                f"🤝 Offers: {offers}",
+                reply_markup=owner_panel_keyboard(),
+            )
+            return
+
+        if data == "owner_sync":
+            await query.edit_message_text(
+                "🔄 Value Sync\n\n"
+                "Live value source adapter hali ulanmagan.\n"
+                "Adapter ulangach shu tugma orqali sync ishga tushadi.",
+                reply_markup=owner_panel_keyboard(),
+            )
+            return
+
+        if data == "owner_news":
+            await query.edit_message_text(
+                "📰 News Control\n\n"
+                "Live news/search adapter hali ulanmagan.\n"
+                "Ulangach news freshness va image pipeline shu yerda boshqariladi.",
+                reply_markup=owner_panel_keyboard(),
+            )
+            return
+
+        if data == "owner_ai":
+            await query.edit_message_text(
+                "🤖 AI Control\n\n"
+                f"API key: {'✅ configured' if AI_API_KEY else '❌ not configured'}",
+                reply_markup=owner_panel_keyboard(),
+            )
+            return
+
+        if data == "owner_logs":
+            conn = db()
+            rows = conn.execute(
+                "SELECT action, details, created_at FROM audit_logs ORDER BY id DESC LIMIT 10"
+            ).fetchall()
+            conn.close()
+
+            if not rows:
+                body = "🛡️ Hali loglar yo'q."
+            else:
+                body = "🛡️ Oxirgi loglar:\n\n" + "\n".join(
+                    f"• {r['created_at']} — {r['action']} {r['details'] or ''}"
+                    for r in rows
+                )
+
+            await query.edit_message_text(
+                body, reply_markup=owner_panel_keyboard()
+            )
+            return
+
+        if data == "owner_settings":
+            await query.edit_message_text(
+                "⚙️ Global Settings\n\n"
+                "Bu bo'limga maintenance, broadcast, freshness policy "
+                "va boshqa global sozlamalar ulanadi.",
+                reply_markup=owner_panel_keyboard(),
+            )
+            return
+
+        if data.startswith("owner_group:"):
+            try:
+                chat_id = int(data.split(":", 1)[1])
+            except ValueError:
+                await query.edit_message_text("❌ Noto'g'ri group ID.")
+                return
+
+            conn = db()
+            row = conn.execute(
+                "SELECT * FROM groups WHERE chat_id=?", (chat_id,)
+            ).fetchone()
+            conn.close()
+
+            if not row:
+                await query.edit_message_text("❌ Guruh topilmadi.")
+                return
+
+            await query.edit_message_text(
+                f"👥 {row['title']}\n\n"
+                f"Bot: {'🟢 ON' if row['enabled'] else '🔴 OFF'}\n"
+                f"AI: {'🟢 ON' if row['ai_enabled'] else '🔴 OFF'}\n"
+                f"Trade: {'🟢 ON' if row['trade_enabled'] else '🔴 OFF'}\n"
+                f"News: {'🟢 ON' if row['news_enabled'] else '🔴 OFF'}\n"
+                f"Market: {'🟢 ON' if row['marketplace_enabled'] else '🔴 OFF'}",
+                reply_markup=group_panel_keyboard(chat_id),
+            )
+            return
+
+    # Group panel
+    if data.startswith("grp_"):
+        if not is_owner(user.id):
+            # For group admins, validate against current chat.
+            if not await is_group_admin(update, context):
+                await query.edit_message_text("⛔ Ruxsat yo'q.")
+                return
+
+        parts = data.split(":")
+        action = parts[0]
+        try:
+            chat_id = int(parts[1])
+        except (IndexError, ValueError):
+            await query.edit_message_text("❌ Noto'g'ri group ID.")
+            return
+
+        field_map = {
+            "grp_ai": "ai_enabled",
+            "grp_trade": "trade_enabled",
+            "grp_news": "news_enabled",
+            "grp_market": "marketplace_enabled",
+            "grp_bot": "enabled",
+        }
+
+        if action in field_map:
+            field = field_map[action]
+            conn = db()
+            row = conn.execute(
+                f"SELECT {field} FROM groups WHERE chat_id=?", (chat_id,)
+            ).fetchone()
+
+            if not row:
+                conn.close()
+                await query.edit_message_text("❌ Guruh topilmadi.")
+                return
+
+            new_value = 0 if row[field] else 1
+            conn.execute(
+                f"UPDATE groups SET {field}=?, updated_at=? WHERE chat_id=?",
+                (new_value, now(), chat_id),
+            )
+            conn.commit()
+            conn.close()
+
+            await query.edit_message_text(
+                f"⚙️ Sozlama yangilandi: {field} = "
+                f"{'ON 🟢' if new_value else 'OFF 🔴'}",
+                reply_markup=group_panel_keyboard(chat_id),
+            )
+            return
+
+        await query.edit_message_text(
+            "⚙️ Group Panel",
+            reply_markup=group_panel_keyboard(chat_id),
+        )
+        return
+
+
+# ============================================================
+# TEXT / TRADE SESSION
+# ============================================================
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user or not update.effective_message:
+        return
+
+    register_user(user)
+    register_group(update.effective_chat)
+
+    session = user_sessions.get(user.id)
+    if not session:
+        await update.effective_message.reply_text(
+            "🤖 Men BloxFruitAI'ning commandlarini tushunaman.\n"
+            "Boshlash uchun /help ni bosing."
+        )
+        return
+
+    if session.get("mode") != "trade":
+        return
+
+    text = update.effective_message.text.strip()
+
+    if session["step"] == "give":
+        session["give"] = text
+        session["step"] = "want"
+        await update.effective_message.reply_text(
+            "2️⃣ Endi siz olmoqchi bo'lgan itemlarni yozing.\n"
+            "Masalan: Kitsune + 2x Money"
+        )
+        return
+
+    if session["step"] == "want":
+        session["want"] = text
+        give = session["give"]
+        want = session["want"]
+        user_sessions.pop(user.id, None)
+
+        result = await calculate_trade(give, want)
+        await update.effective_message.reply_text(result)
+        return
+
+
+# ============================================================
+# ERROR HANDLER
+# ============================================================
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled bot error", exc_info=context.error)
+
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text(
+                "⚠️ Texnik xatolik yuz berdi.\n"
+                "Bot ishlashda davom etadi. Keyinroq qayta urinib ko'ring."
+            )
+    except Exception:
+        logger.exception("Could not send error message")
+
+
+# ============================================================
+# POST INIT
+# ============================================================
+
+async def post_init(application: Application) -> None:
+    commands = [
+        BotCommand("start", "Botni boshlash"),
+        BotCommand("help", "Barcha yordam"),
+        BotCommand("value", "Item value"),
+        BotCommand("values", "Values bo'limi"),
+        BotCommand("trade", "Trade Calculator"),
+        BotCommand("offer", "Offer"),
+        BotCommand("trades", "Marketplace"),
+        BotCommand("profile", "Profil"),
+        BotCommand("news", "Eng yangi news"),
+        BotCommand("update", "Eng yangi update"),
+        BotCommand("search", "Live qidiruv"),
+        BotCommand("ai", "Blox Fruits AI"),
+        BotCommand("admin", "Admin Panel"),
+        BotCommand("cancel", "Joriy amalni bekor qilish"),
+    ]
+    await application.bot.set_my_commands(commands)
+    logger.info("BloxFruitAI bot commands configured.")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main() -> None:
+    if BOT_TOKEN == "PUT_BOT_TOKEN_HERE" or not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN .env fayliga qo'yilmagan. "
+            "Masalan: BOT_TOKEN=123456:ABC..."
+        )
+
+    init_db()
+
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("value", value_command))
+    application.add_handler(CommandHandler("values", values_command))
+    application.add_handler(CommandHandler("trade", trade_command))
+    application.add_handler(CommandHandler("offer", offer_command))
+    application.add_handler(CommandHandler("trades", trades_command))
+    application.add_handler(CommandHandler("profile", profile_command))
+    application.add_handler(CommandHandler("news", news_command))
+    application.add_handler(CommandHandler("update", update_command))
+    application.add_handler(CommandHandler("search", search_command))
+    application.add_handler(CommandHandler("ai", ai_command))
+    application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CommandHandler("cancel", cancel_command))
+
+    application.add_handler(CallbackQueryHandler(callback_handler))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler)
+    )
+
+    application.add_error_handler(error_handler)
+
+    logger.info("🚀 BloxFruitAI starting...")
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
+
+
+if __name__ == "__main__":
+    main()
