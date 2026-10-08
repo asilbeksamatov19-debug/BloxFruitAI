@@ -310,17 +310,16 @@ def _slugify(name: str) -> str:
 
 
 def _extract_live_item(text, query, category):
-    q=query.lower().strip()
-    pos=text.lower().find(q)
+    pos=text.lower().find(query.lower().strip())
     if pos<0:return None
     w=text[pos:pos+1200]
-    m=re.search(r"\\b(\\d+(?:\\.\\d+)?[KMBT])\\b",w,re.I)
+    m=re.search(r"\b(\d+(?:\.\d+)?[KMBT])\b",w,re.I)
     if not m:return None
-    d=re.search(r"Demand\\s+(\\d+(?:\\.\\d+)?)/10",w,re.I)
+    d=re.search(r"Demand\s+(\d+(?:\.\d+)?)/10",w,re.I)
     trend="Unknown"
     for x in ("Stable","Overpaid","Underpaid","Fluctuating","Unstable"):
-        if re.search(r"\\b"+x+r"\\b",w,re.I):trend=x;break
-    u=re.search(r"Updated\\s+(.{1,40}?)(?=\\s+(?:Price history|$))",w,re.I)
+        if re.search(r"\b"+re.escape(x)+r"\b",w,re.I):trend=x;break
+    u=re.search(r"Updated\s+(.{1,40}?)(?=\s+(?:Price history|$))",w,re.I)
     return {"name":query,"value":m.group(1).upper(),"demand":float(d.group(1)) if d else "N/A","trend":trend,"updated_at":u.group(1).strip() if u else "Unknown","category":category,"source":"https://bloxfruitsvalues.com/"}
 
 async def get_live_value(query):
