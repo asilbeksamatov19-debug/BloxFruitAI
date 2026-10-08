@@ -311,7 +311,7 @@ def _slugify(name: str) -> str:
 
 def _extract_live_item(text, query, category):
     m=re.search(
-        r'Regular value</span><div[^>]*>.*?<span[^>]*class="[^"]*text-3xl[^"]*"[^>]*>([0-9]+(?:\.[0-9]+)?[KMBT])</span>',
+        r'(?:Regular value|Value)</span>.*?<span[^>]*class="[^"]*text-3xl[^"]*"[^>]*>([0-9]+(?:\.[0-9]+)?[KMBT])\s*</span>',
         text,re.I|re.S
     )
     if not m:
@@ -343,6 +343,42 @@ def _extract_live_item(text, query, category):
         "category":category,
         "source":"https://bloxfruitsvalues.com/"
     }
+
+async def get_live_value(query: str):
+    query=query.strip()
+    if not query:
+        return None
+
+    aliases={
+        "dragon":["West Dragon","East Dragon"],
+        "dragon fruit":["West Dragon","East Dragon"],
+    }
+
+    q=query.lower()
+    candidates=aliases.get(q,[query])
+
+    for candidate in candidates:
+        slug=_slugify(candidate)
+
+        if q.startswith(("2x ", "x2 ")) or "gamepass" in q:
+            categories=("gamepasses","fruits","limiteds","skins","perm-fruits")
+        elif q.startswith("perm ") or q.startswith("permanent "):
+            categories=("perm-fruits","fruits","gamepasses","limiteds","skins")
+        else:
+            categories=("fruits","gamepasses","limiteds","skins","perm-fruits")
+
+        for category in categories:
+            url=f"https://bloxfruitsvalues.com/values/{category}/{slug}"
+            try:
+                html=await _http_get(url)
+                result=_extract_live_item(html,candidate,category)
+                if result:
+                    return result
+            except Exception as exc:
+                logging.debug("Live value fetch failed: %s",exc)
+
+    return None
+
 
 def _strip_html(value: str) -> str:
     value = re.sub(r"<script.*?</script>", " ", value, flags=re.I | re.S)
