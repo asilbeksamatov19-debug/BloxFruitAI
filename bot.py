@@ -312,33 +312,35 @@ def _slugify(name: str) -> str:
 def _extract_live_item(text: str, query: str, category: str):
     q = query.lower().strip()
     pos = text.lower().find(q)
-    window = text[max(0, pos - 250):pos + 1800] if pos >= 0 else text[:5000]
+    if pos < 0:
+        return None
 
+    window = text[pos:pos + 1200]
     value = None
-    for label in ("Regular value", "Value"):
-        m = re.search(re.escape(label) + r"\s+(\d+(?:\.\d+)?[KMBT])", window, re.I)
-        if m:
-            value = m.group(1)
-            break
+
+    m = re.search(r"\\b(\\d+(?:\\.\\d+)?[KMBT])\\b", window, re.I)
+    if m:
+        value = m.group(1).upper()
 
     demand = None
-    m = re.search(r"Demand\s+(\d+(?:\.\d+)?)/10", window, re.I)
+    m = re.search(r"Demand\\s+(\\d+(?:\\.\\d+)?)/10", window, re.I)
     if m:
         demand = float(m.group(1))
 
     trend = "Unknown"
     for candidate in ("Stable", "Overpaid", "Underpaid", "Fluctuating", "Unstable"):
-        if re.search(r"\b" + re.escape(candidate) + r"\b", window, re.I):
+        if re.search(r"\\b" + re.escape(candidate) + r"\\b", window, re.I):
             trend = candidate
             break
 
     updated = "Unknown"
-    m = re.search(r"(?:Last updated|Updated)\s+(.{1,45}?)(?:Price history|$)", window, re.I)
+    m = re.search(r"Updated\\s+(.{1,35}?)(?=\\s+(?:Mythical|Legendary|Rare|Uncommon|Common)\\s+|$)", window, re.I)
     if m:
-        updated = re.sub(r"\s+", " ", m.group(1)).strip()
+        updated = re.sub(r"\\s+", " ", m.group(1)).strip()
 
     if not value:
         return None
+
     return {
         "name": query,
         "value": value,
@@ -351,32 +353,40 @@ def _extract_live_item(text: str, query: str, category: str):
 
 
 async def get_live_value(query: str) -> Optional[dict]:
-    """Fetch a fresh item page from Blox Fruits Values; never invent values."""
     query = query.strip()
     if not query:
         return None
 
-    categories = ("fruits", "gamepasses", "limiteds", "skins", "perm-fruits")
-    slug = _slugify(query)
+    aliases = {
+        "dragon": ["West Dragon", "East Dragon"],
+        "dragon fruit": ["West Dragon", "East Dragon"],
+    }
 
-    for category in categories:
-        urls = [
-            f"https://bloxfruitsvalues.com/values/{category}/{slug}",
-            f"https://bloxfruitsvalues.com/value/{category}/{slug}",
-            f"https://bloxfruitsvalues.com/values/{category}",
-        ]
-        for url in urls:
-            try:
-                html = await asyncio.to_thread(_http_get, url)
-                text = _page_text(html)
-                if query.lower() in text.lower():
-                    result = _extract_live_item(text, query, category)
-                    if result:
-                        return result
-            except Exception as exc:
-                logging.debug("Value fetch failed %s: %s", url, exc)
+    candidates = aliases.get(query.lower(), [query])
+    categories = ("fruits", "gamepasses", "limiteds")
+
+    for candidate in candidates:
+        slug = _slugify(candidate)
+
+        for category in categories:
+            urls = [
+                f"https://bloxfruitsvalues.com/values/{category}/{slug}",
+                f"https://bloxfruitsvalues.com/values/{category}",
+            ]
+
+            for url in urls:
+                try:
+                    html = await asyncio.to_thread(_http_get, url)
+                    text = _page_text(html)
+
+                    if candidate.lower() in text.lower():
+                        result = _extract_live_item(text, candidate, category)
+                        if result:
+                            return result
+                except Exception as exc:
+                    logging.debug("Live value fetch failed %s: %s", url, exc)
+
     return None
-
 
 def _strip_html(value: str) -> str:
     value = re.sub(r"<script.*?</script>", " ", value, flags=re.I | re.S)
