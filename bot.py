@@ -311,31 +311,28 @@ def _slugify(name: str) -> str:
 
 def _extract_live_item(text, query, category):
     q=query.strip()
-    pos=text.lower().find(q.lower())
-    if pos < 0:
-        return None
-    w=text[pos:pos+8000]
-
-    m=re.search(r"Regular value.*?(\\d+(?:\\.\\d+)?[KMBT])",w,re.I|re.S)
-    if not m:
-        m=re.search(r"\\b(\\d+(?:\\.\\d+)?[KMBT])\\b",w,re.I)
+    m=re.search(
+        r"Regular value.*?<span[^>]*>([0-9]+(?:\\.[0-9]+)?[KMBT])</span>",
+        text, re.I|re.S
+    )
     if not m:
         return None
 
-    d=re.search(r"Demand\\s*(?:</?[^>]+>\\s*)*(\\d+(?:\\.\\d+)?)/10",w,re.I|re.S)
+    d=re.search(r"Demand.*?([0-9]+(?:\\.[0-9]+)?)/10",text,re.I|re.S)
     trend="Unknown"
     for x in ("Stable","Overpaid","Underpaid","Fluctuating","Unstable"):
-        if re.search(r"\\b"+re.escape(x)+r"\\b",w,re.I):
+        if re.search(r"\\b"+re.escape(x)+r"\\b",text,re.I):
             trend=x
             break
 
-    u=re.search(r"(?:Last updated|Updated)\\s*(?:</?[^>]+>\\s*)*([^<\\n]{1,40})",w,re.I|re.S)
+    u=re.search(r"(?:Last updated|Updated).*?([0-9]+\\s+(?:minutes?|hours?|days?|weeks?|months?)\\s+ago)",text,re.I|re.S)
+
     return {
         "name":q,
         "value":m.group(1).upper(),
         "demand":float(d.group(1)) if d else "N/A",
         "trend":trend,
-        "updated_at":u.group(1).strip() if u else "Unknown",
+        "updated_at":u.group(1) if u else "Unknown",
         "category":category,
         "source":"https://bloxfruitsvalues.com/"
     }
@@ -344,9 +341,15 @@ async def get_live_value(query):
     query=query.strip()
     if not query:
         return None
-    aliases={"dragon":["West Dragon","East Dragon"],"dragon fruit":["West Dragon","East Dragon"]}
+
+    aliases={
+        "dragon":["West Dragon","East Dragon"],
+        "dragon fruit":["West Dragon","East Dragon"]
+    }
+
     for candidate in aliases.get(query.lower(),[query]):
         slug=_slugify(candidate)
+
         for category in ("fruits","gamepasses","limiteds","skins","perm-fruits"):
             url=f"https://bloxfruitsvalues.com/values/{category}/{slug}"
             try:
@@ -356,6 +359,7 @@ async def get_live_value(query):
                     return result
             except Exception as exc:
                 logging.debug("Value fetch failed: %s",exc)
+
     return None
 
 def _strip_html(value: str) -> str:
