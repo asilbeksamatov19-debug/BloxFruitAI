@@ -662,10 +662,314 @@ async def trade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def offer_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    register_user(user)
+    raw = " ".join(context.args).strip()
+
+    if not raw or "|" not in raw:
+        await update.effective_message.reply_text(
+            "🤝 Offer yuborish\n\n"
+            "Foydalanish:\n"
+            "/offer <trade_id> | <siz berasiz> | <siz olasiz>\n\n"
+            "Misol:\n"
+            "/offer 12 | Dragon | Kitsune\n\n"
+            "Ochiq trade'larni ko'rish: /trades"
+        )
+        return
+
+    parts = [x.strip() for x in raw.split("|")]
+    if len(parts) != 3:
+        await update.effective_message.reply_text(
+            "❌ Format noto'g'ri.\n"
+            "/offer 12 | Dragon | Kitsune"
+        )
+        return
+
+    try:
+        trade_id = int(parts[0])
+    except ValueError:
+        await update.effective_message.reply_text("❌ Trade ID raqam bo'lishi kerak.")
+        return
+
+    give_items, want_items = parts[1], parts[2]
+    if not give_items or not want_items:
+        await update.effective_message.reply_text("❌ Beradigan va oladigan itemlarni kiriting.")
+        return
+
+    conn = db()
+    trade = conn.execute(
+        "SELECT * FROM trades WHERE id=? AND status='open'", (trade_id,)
+    ).fetchone()
+
+    if not trade:
+        conn.close()
+        await update.effective_message.reply_text("❌ Bu trade mavjud emas yoki yopilgan.")
+        return
+
+    if trade["owner_id"] == user.id:
+        conn.close()
+        await update.effective_message.reply_text("❌ O'zingizning trade'ingizga offer yubora olmaysiz.")
+        return
+
+    existing = conn.execute(
+        "SELECT id FROM offers WHERE trade_id=? AND from_user_id=? AND status='pending'",
+        (trade_id, user.id),
+    ).fetchone()
+
+    if existing:
+        conn.close()
+        await update.effective_message.reply_text(
+            f"⚠️ Sizda bu trade uchun #{existing['id']} pending offer bor."
+        )
+        return
+
+    cur = conn.execute(
+        """
+        INSERT INTO offers(trade_id, from_user_id, give_items, want_items, status, created_at)
+        VALUES (?, ?, ?, ?, 'pending', ?)
+        """,
+        (trade_id, user.id, give_items, want_items, now()),
+    )
+    offer_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+
+    log_action(user.id, "offer_created", f"offer={offer_id},trade={trade_id}")
+
+    try:
+        await context.bot.send_message(
+            chat_id=trade["owner_id"],
+            text=(
+                f"🤝 Yangi Trade Offer #{offer_id}\n\n"
+                f"🔄 Trade #{trade_id}\n"
+                f"👤 Yuboruvchi: @{user.username or user.first_name}\n\n"
+                f"📤 U beradi: {give_items}\n"
+                f"📥 U oladi: {want_items}\n\n"
+                f"✅ Qabul qilish: /accept {offer_id}\n"
+                f"🔄 Counter: /counter {offer_id} | itemlar | itemlar\n"
+                f"❌ Rad etish: /decline {offer_id}"
+            ),
+        )
+    except Exception:
+        logger.exception("Could not notify trade owner")
+
     await update.effective_message.reply_text(
-        "🤝 Offer tizimi\n\n"
-        "Offer yuborish uchun avval /trades orqali ochiq trade tanlang.\n"
-        "Keyingi bosqichda Accept ✅ / Counter Offer 🔄 / Decline ❌ tizimi ishlaydi."
+        f"✅ Offer #{offer_id} yuborildi!\n\n"
+        f"🔄 Trade: #{trade_id}\n"
+        f"📤 Siz berasiz: {give_items}\n"
+        f"📥 Siz olasiz: {want_items}"
+    )
+
+
+async def accept_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    register_user(user)
+
+    if len(context.args) != 1:
+        await update.effective_message.reply_text("Foydalanish: /accept <offer_id>")
+        return
+
+    try:
+        offer_id = int(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("❌ Offer ID raqam bo'lishi kerak.")
+        return
+
+    conn = db()
+    row = conn.execute(
+        """
+        SELECT o.*, t.owner_id, t.status AS trade_status
+        FROM offers o
+        JOIN trades t ON t.id=o.trade_id
+        WHERE o.id=?
+        """,
+        (offer_id,),
+    ).fetchone()
+
+    if not row:
+        conn.close()
+        await update.effective_message.reply_text("❌ Offer topilmadi.")
+        return
+
+    if row["owner_id"] != user.id:
+        conn.close()
+        await update.effective_message.reply_text("⛔ Bu offerni faqat trade egasi boshqara oladi.")
+        return
+
+    if row["status"] != "pending" or row["trade_status"] != "open":
+        conn.close()
+        await update.effective_message.reply_text("⚠️ Bu offer endi faol emas.")
+        return
+
+    conn.execute("UPDATE offers SET status='accepted' WHERE id=?", (offer_id,))
+    conn.execute(
+        "UPDATE offers SET status='declined' WHERE trade_id=? AND id<>? AND status='pending'",
+        (row["trade_id"], offer_id),
+    )
+    conn.execute("UPDATE trades SET status='accepted' WHERE id=?", (row["trade_id"],))
+    conn.commit()
+    conn.close()
+
+    log_action(user.id, "offer_accepted", f"offer={offer_id}")
+
+    try:
+        await context.bot.send_message(
+            chat_id=row["from_user_id"],
+            text=(
+                f"✅ Offer #{offer_id} QABUL QILINDI!\n\n"
+                f"📤 Siz berasiz: {row['give_items']}\n"
+                f"📥 Siz olasiz: {row['want_items']}\n\n"
+                "⚠️ Bot faqat kelishuvni boshqaradi. Roblox trade'ni o'yin ichida o'zingiz bajaring."
+            ),
+        )
+    except Exception:
+        logger.exception("Could not notify offer sender")
+
+    await update.effective_message.reply_text(
+        f"✅ Offer #{offer_id} qabul qilindi. Trade yopildi."
+    )
+
+
+async def decline_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    register_user(user)
+
+    if len(context.args) != 1:
+        await update.effective_message.reply_text("Foydalanish: /decline <offer_id>")
+        return
+
+    try:
+        offer_id = int(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("❌ Offer ID raqam bo'lishi kerak.")
+        return
+
+    conn = db()
+    row = conn.execute(
+        """
+        SELECT o.*, t.owner_id
+        FROM offers o JOIN trades t ON t.id=o.trade_id
+        WHERE o.id=?
+        """,
+        (offer_id,),
+    ).fetchone()
+
+    if not row:
+        conn.close()
+        await update.effective_message.reply_text("❌ Offer topilmadi.")
+        return
+
+    if row["owner_id"] != user.id and row["from_user_id"] != user.id:
+        conn.close()
+        await update.effective_message.reply_text("⛔ Siz bu offerni boshqara olmaysiz.")
+        return
+
+    if row["status"] != "pending":
+        conn.close()
+        await update.effective_message.reply_text("⚠️ Bu offer allaqachon yopilgan.")
+        return
+
+    conn.execute("UPDATE offers SET status='declined' WHERE id=?", (offer_id,))
+    conn.commit()
+    conn.close()
+
+    log_action(user.id, "offer_declined", f"offer={offer_id}")
+    await update.effective_message.reply_text(f"❌ Offer #{offer_id} rad etildi.")
+
+    target = row["from_user_id"] if row["owner_id"] == user.id else row["owner_id"]
+    try:
+        await context.bot.send_message(
+            chat_id=target,
+            text=f"❌ Trade Offer #{offer_id} rad etildi."
+        )
+    except Exception:
+        logger.exception("Could not notify declined offer")
+
+
+async def counter_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    register_user(user)
+    raw = " ".join(context.args).strip()
+
+    if "|" not in raw:
+        await update.effective_message.reply_text(
+            "Foydalanish:\n/counter <offer_id> | <siz berasiz> | <siz olasiz>\n\n"
+            "Misol:\n/counter 15 | Buddha + Portal | Kitsune"
+        )
+        return
+
+    parts = [x.strip() for x in raw.split("|")]
+    if len(parts) != 3:
+        await update.effective_message.reply_text("❌ Format noto'g'ri.")
+        return
+
+    try:
+        offer_id = int(parts[0])
+    except ValueError:
+        await update.effective_message.reply_text("❌ Offer ID raqam bo'lishi kerak.")
+        return
+
+    give_items, want_items = parts[1], parts[2]
+    if not give_items or not want_items:
+        await update.effective_message.reply_text("❌ Itemlarni to'liq kiriting.")
+        return
+
+    conn = db()
+    old = conn.execute(
+        """
+        SELECT o.*, t.owner_id, t.status AS trade_status
+        FROM offers o JOIN trades t ON t.id=o.trade_id
+        WHERE o.id=?
+        """,
+        (offer_id,),
+    ).fetchone()
+
+    if not old:
+        conn.close()
+        await update.effective_message.reply_text("❌ Offer topilmadi.")
+        return
+
+    if user.id not in (old["owner_id"], old["from_user_id"]):
+        conn.close()
+        await update.effective_message.reply_text("⛔ Siz bu offerda qatnashmagansiz.")
+        return
+
+    if old["status"] != "pending" or old["trade_status"] != "open":
+        conn.close()
+        await update.effective_message.reply_text("⚠️ Bu offer endi faol emas.")
+        return
+
+    conn.execute("UPDATE offers SET status='countered' WHERE id=?", (offer_id,))
+    cur = conn.execute(
+        """
+        INSERT INTO offers(trade_id, from_user_id, give_items, want_items, status, created_at)
+        VALUES (?, ?, ?, ?, 'pending', ?)
+        """,
+        (old["trade_id"], user.id, give_items, want_items, now()),
+    )
+    new_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+
+    target = old["from_user_id"] if user.id == old["owner_id"] else old["owner_id"]
+
+    try:
+        await context.bot.send_message(
+            chat_id=target,
+            text=(
+                f"🔄 Counter Offer #{new_id}\n\n"
+                f"📤 Beradi: {give_items}\n"
+                f"📥 Oladi: {want_items}\n\n"
+                f"✅ /accept {new_id}\n"
+                f"❌ /decline {new_id}\n"
+                f"🔄 /counter {new_id} | itemlar | itemlar"
+            ),
+        )
+    except Exception:
+        logger.exception("Could not notify counter target")
+
+    await update.effective_message.reply_text(
+        f"✅ Counter Offer #{new_id} yuborildi."
     )
 
 
@@ -1256,6 +1560,9 @@ def main() -> None:
     application.add_handler(CommandHandler("values", values_command))
     application.add_handler(CommandHandler("trade", trade_command))
     application.add_handler(CommandHandler("offer", offer_command))
+    application.add_handler(CommandHandler("accept", accept_command))
+    application.add_handler(CommandHandler("decline", decline_command))
+    application.add_handler(CommandHandler("counter", counter_command))
     application.add_handler(CommandHandler("trades", trades_command))
     application.add_handler(CommandHandler("profile", profile_command))
     application.add_handler(CommandHandler("news", news_command))
