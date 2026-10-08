@@ -2,3 +2,5 @@
 bot.db
 __pycache__/
 bot_backup_*.py
+
+bloxfruitai.db

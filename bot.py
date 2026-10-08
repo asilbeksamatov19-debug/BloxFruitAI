@@ -39,7 +39,6 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_BOT_TOKEN_HERE")
 OWNER_ID_RAW = os.getenv("OWNER_ID", "0")
-AI_API_KEY = os.getenv("AI_API_KEY", "")
 DB_PATH = os.getenv("DB_PATH", "bloxfruitai.db")
 
 try:
@@ -248,7 +247,6 @@ async def send_menu(update: Update, text: str) -> None:
             InlineKeyboardButton("📰 News", callback_data="menu_news"),
         ],
         [
-            InlineKeyboardButton("🤖 AI", callback_data="menu_ai"),
             InlineKeyboardButton("👤 Profile", callback_data="menu_profile"),
         ],
         [
@@ -299,85 +297,133 @@ def _page_text(html: str) -> str:
 
 
 def _parse_value(raw: str):
-    m = re.search(r"\b(\d+(?:\.\d+)?)([KMBT])\b", raw, re.I)
+    m = re.search(r"\b(\d+(?:\.\d+)?)([KMBT])\b", str(raw), re.I)
     if not m:
         return None
     return f"{m.group(1)}{m.group(2).upper()}"
 
 
-def _slugify(name: str) -> str:
+def _format_live_number(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "N/A"
+
+    if value <= 0:
+        return "N/A"
+
+    for unit, divisor in (("T", 1e12), ("B", 1e9), ("M", 1e6), ("K", 1e3)):
+        if value >= divisor:
+            result = value / divisor
+            formatted = f"{result:.2f}".rstrip("0").rstrip(".")
+            return f"{formatted}{unit}"
+
+    return str(int(value))
+
+
+def _slugify(name: str):
     return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", name.lower())).strip("-")
 
 
-def _extract_live_item(text, query, category):
-    m=re.search(
-        r'(?:Regular value|Value)</span>.*?<span[^>]*class="[^"]*text-3xl[^"]*"[^>]*>([0-9]+(?:\.[0-9]+)?[KMBT]|N/A)\s*</span>',
-        text,re.I|re.S
-    )
-    if not m:
+def _extract_live_item(text, query, category, permanent=False):
+    metadata_start = text.find(r'\"metadata\"')
+    if metadata_start == -1:
+        metadata_start = text.find('"metadata"')
+    if metadata_start == -1:
         return None
 
-    demand_m=re.search(
-        r'>Demand\s*</span>.*?<span[^>]*>([0-9]+(?:\.[0-9]+)?)/10\s*</span>',
-        text,re.I|re.S
-    )
-    updated_m=re.search(
-        r'>Last updated\s*</span>.*?<span[^>]*>([^<]+?)\s*</span>',
-        text,re.I|re.S
-    )
+    metadata = text[metadata_start:metadata_start + 5000]
 
-    start=m.start()
-    block=text[start:start+3000]
-    trend="Unknown"
-    for x in ("Stable","Overpaid","Underpaid","Fluctuating","Unstable"):
-        if re.search(r"\b"+re.escape(x)+r"\b",block,re.I):
-            trend=x
-            break
+    def get_number(key):
+        patterns = (
+            rf'\\"{re.escape(key)}\\"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
+            rf'"{re.escape(key)}"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
+        )
+        for pattern in patterns:
+            m = re.search(pattern, metadata, re.I)
+            if m:
+                return float(m.group(1))
+        return None
+
+    def get_string(key):
+        patterns = (
+            rf'\\"{re.escape(key)}\\"\s*:\s*\\"([^"]*)\\"',
+            rf'"{re.escape(key)}"\s*:\s*"([^"]*)"',
+        )
+        for pattern in patterns:
+            m = re.search(pattern, metadata, re.I)
+            if m:
+                return m.group(1).strip()
+        return None
+
+    value_key = "permValue" if permanent else "regValue"
+    demand_key = "permDemand" if permanent else "regDemand"
+    trend_key = "permTrend" if permanent else "regTrend"
+
+    value = get_number(value_key)
+    demand = get_number(demand_key)
+    trend = get_string(trend_key)
+
+    if value is None:
+        return None
+
+    updated_m = re.search(
+        r'(?:\\"|")updatedAt(?:\\"|")\s*:\s*(?:\\"|")([^"]+)',
+        text,
+        re.I,
+    )
 
     return {
-        "name":query,
-        "value":m.group(1).upper(),
-        "demand":float(demand_m.group(1)) if demand_m else "N/A",
-        "trend":trend,
-        "updated_at":updated_m.group(1).strip() if updated_m else "Unknown",
-        "category":category,
-        "source":"https://bloxfruitsvalues.com/"
+        "name": query,
+        "value": _format_live_number(value),
+        "demand": demand if demand is not None else "N/A",
+        "trend": trend or "Unknown",
+        "updated_at": updated_m.group(1) if updated_m else "Unknown",
+        "category": category,
+        "permanent": permanent,
+        "source": "https://bloxfruitsvalues.com/",
     }
 
+
 async def get_live_value(query: str):
-    query=query.strip()
+    query = query.strip()
     if not query:
         return None
 
-    aliases={
-        "dragon":["West Dragon","East Dragon"],
-        "dragon fruit":["West Dragon","East Dragon"],
-        "perm dragon":["Permanent Dragon Token"],
-        "permanent dragon":["Permanent Dragon Token"],
+    q = query.lower()
+    permanent = bool(re.match(r"^(perm|permanent)\s+", q))
+
+    clean_query = re.sub(
+        r"^(perm|permanent)\s+",
+        "",
+        query,
+        flags=re.I,
+    ).strip()
+
+    aliases = {
+        "dragon fruit": "dragon",
     }
 
-    q=query.lower()
-    candidates=aliases.get(q,[query])
+    candidate = aliases.get(clean_query.lower(), clean_query)
+    slug = _slugify(candidate)
 
-    for candidate in candidates:
-        slug=_slugify(candidate)
+    categories = ("fruits", "gamepasses", "limiteds", "skins", "perm-fruits")
 
-        if q.startswith(("2x ", "x2 ")) or "gamepass" in q:
-            categories=("gamepasses","fruits","limiteds","skins","perm-fruits")
-        elif q.startswith("perm ") or q.startswith("permanent "):
-            categories=("perm-fruits","fruits","gamepasses","limiteds","skins")
-        else:
-            categories=("fruits","gamepasses","limiteds","skins","perm-fruits")
+    for category in categories:
+        url = f"https://bloxfruitsvalues.com/values/{category}/{slug}"
 
-        for category in categories:
-            url=f"https://bloxfruitsvalues.com/values/{category}/{slug}"
-            try:
-                html=await _http_get(url)
-                result=_extract_live_item(html,candidate,category)
-                if result:
-                    return result
-            except Exception as exc:
-                logging.debug("Live value fetch failed: %s",exc)
+        try:
+            html = await _http_get(url)
+            result = _extract_live_item(
+                html,
+                candidate,
+                category,
+                permanent=permanent,
+            )
+            if result:
+                return result
+        except Exception as exc:
+            logging.debug("Live value fetch failed: %s", exc)
 
     return None
 
@@ -432,61 +478,6 @@ async def search_latest_news(query: str = "Blox Fruits latest update") -> list[d
         })
     return items
 
-
-async def ask_blox_ai(question: str) -> str:
-    """Use an OpenAI-compatible API when AI_API_KEY is supplied."""
-    if not AI_API_KEY:
-        return (
-            "🤖 AI_API_KEY hali qo'yilmagan.\n\n"
-            ".env ichiga AI_API_KEY qo'yilgach /ai ishlaydi."
-        )
-
-    api_url = os.getenv("AI_API_URL", "https://api.openai.com/v1/chat/completions")
-    model = os.getenv("AI_MODEL", "gpt-4o-mini")
-    system = (
-        "You are BloxFruitAI. Answer in Uzbek unless the user asks otherwise. "
-        "Help with Blox Fruits values, trading, builds and game mechanics. "
-        "Never claim a live value/news fact is current unless supplied by fresh data. "
-        "Be concise and warn that actual Roblox trades happen in-game."
-    )
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": question},
-        ],
-        "temperature": 0.3,
-    }
-    try:
-        def call():
-            req = Request(
-                api_url,
-                data=json.dumps(payload).encode(),
-                headers={
-                    "Authorization": f"Bearer {AI_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                method="POST",
-            )
-            with urlopen(req, timeout=30) as response:
-                return json.loads(response.read().decode())
-        data = await asyncio.to_thread(call)
-        return data["choices"][0]["message"]["content"].strip()
-    except Exception as exc:
-        logging.exception("AI request failed")
-        return f"⚠️ AI so'rovini bajarib bo'lmadi: {type(exc).__name__}"
-
-
-def _split_items(raw: str) -> list[str]:
-    return [x.strip() for x in re.split(r"\s*(?:\+|,|;)\s*", raw) if x.strip()]
-
-
-def _number_value(value: str) -> float:
-    m = re.match(r"(\d+(?:\.\d+)?)([KMBT])?$", value.strip(), re.I)
-    if not m:
-        return 0.0
-    n = float(m.group(1))
-    return n * {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}.get((m.group(2) or "").upper(), 1)
 
 
 async def calculate_trade(give_items: str, want_items: str) -> str:
@@ -559,7 +550,6 @@ HELP_TEXT = """
 /update — Eng so'nggi update
 
 🤖 AI
-/ai <savol> — Blox Fruits AI
 
 👑 ADMIN
 /admin — Owner/Group Admin Panel
@@ -1096,17 +1086,6 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 
-async def ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    question = " ".join(context.args).strip()
-    if not question:
-        await update.effective_message.reply_text(
-            "🤖 Foydalanish:\n/ai Dragon uchun best build?"
-        )
-        return
-
-    answer = await ask_blox_ai(question)
-    await update.effective_message.reply_text(answer)
-
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_sessions.pop(update.effective_user.id, None)
@@ -1129,7 +1108,6 @@ def owner_panel_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("📰 News", callback_data="owner_news"),
             ],
             [
-                InlineKeyboardButton("🤖 AI", callback_data="owner_ai"),
                 InlineKeyboardButton("🛡️ Logs", callback_data="owner_logs"),
             ],
             [
@@ -1237,11 +1215,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
 
-    if data == "menu_ai":
-        await query.edit_message_text(
-            "🤖 AI\n\n/ai <savol> — Blox Fruits AI"
-        )
-        return
 
     if data == "menu_profile":
         await profile_command(update, context)
@@ -1329,13 +1302,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
             return
 
-        if data == "owner_ai":
-            await query.edit_message_text(
-                "🤖 AI Control\n\n"
-                f"API key: {'✅ configured' if AI_API_KEY else '❌ not configured'}",
-                reply_markup=owner_panel_keyboard(),
-            )
-            return
 
         if data == "owner_logs":
             conn = db()
@@ -1466,10 +1432,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     session = user_sessions.get(user.id)
     if not session:
-        await update.effective_message.reply_text(
-            "🤖 Men BloxFruitAI'ning commandlarini tushunaman.\n"
-            "Boshlash uchun /help ni bosing."
-        )
         return
 
     if session.get("mode") != "trade":
@@ -1573,7 +1535,6 @@ def main() -> None:
     application.add_handler(CommandHandler("news", news_command))
     application.add_handler(CommandHandler("update", update_command))
     application.add_handler(CommandHandler("search", search_command))
-    application.add_handler(CommandHandler("ai", ai_command))
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
 
