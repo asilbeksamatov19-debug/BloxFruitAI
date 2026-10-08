@@ -356,12 +356,13 @@ async def get_live_value(query: str) -> Optional[dict]:
     if not query:
         return None
 
-    categories = ("fruits", "gamepasses", "limiteds")
+    categories = ("fruits", "gamepasses", "limiteds", "skins", "perm-fruits")
     slug = _slugify(query)
 
     for category in categories:
         urls = [
             f"https://bloxfruitsvalues.com/values/{category}/{slug}",
+            f"https://bloxfruitsvalues.com/value/{category}/{slug}",
             f"https://bloxfruitsvalues.com/values/{category}",
         ]
         for url in urls:
