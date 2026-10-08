@@ -331,7 +331,7 @@ async def get_live_value(query):
         for category in ("fruits","gamepasses","limiteds","skins","perm-fruits"):
             for url in (f"https://bloxfruitsvalues.com/values/{category}/{slug}",f"https://bloxfruitsvalues.com/values/{category}"):
                 try:
-                    html=await asyncio.to_thread(_http_get,url)
+                    html=await _http_get(url)
                     text=_page_text(html)
                     if candidate.lower() in text.lower():
                         r=_extract_live_item(text,candidate,category)
