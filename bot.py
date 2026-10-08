@@ -310,25 +310,27 @@ def _slugify(name: str) -> str:
 
 
 def _extract_live_item(text, query, category):
-    q=query.strip()
-    m=re.search(
-        r"Regular value</span><div[^>]*>.*?<span[^>]*>([0-9]+(?:\\.[0-9]+)?[KMBT])</span>",
-        text, re.I|re.S
-    )
+    marker="Regular value</span>"
+    pos=text.find(marker)
+    if pos<0:
+        return None
+    block=text[pos+len(marker):pos+1500]
+
+    m=re.search(r"<span[^>]*>([0-9]+(?:\\.[0-9]+)?[KMBT])</span>",block,re.I)
     if not m:
         return None
 
-    d=re.search(r"Demand.*?([0-9]+(?:\\.[0-9]+)?)/10",text,re.I|re.S)
+    d=re.search(r"Demand.*?([0-9]+(?:\\.[0-9]+)?)/10",text[pos:pos+8000],re.I|re.S)
     trend="Unknown"
     for x in ("Stable","Overpaid","Underpaid","Fluctuating","Unstable"):
-        if re.search(r"\\b"+re.escape(x)+r"\\b",text,re.I):
+        if re.search(r"\\b"+re.escape(x)+r"\\b",block,re.I):
             trend=x
             break
 
-    u=re.search(r"(?:Last updated|Updated).*?([0-9]+\\s+(?:minutes?|hours?|days?|weeks?|months?)\\s+ago)",text,re.I|re.S)
+    u=re.search(r"(?:Last updated|Updated).*?([0-9]+\\s+(?:minutes?|hours?|days?|weeks?|months?)\\s+ago)",text[pos:pos+8000],re.I|re.S)
 
     return {
-        "name":q,
+        "name":query,
         "value":m.group(1).upper(),
         "demand":float(d.group(1)) if d else "N/A",
         "trend":trend,
@@ -336,31 +338,6 @@ def _extract_live_item(text, query, category):
         "category":category,
         "source":"https://bloxfruitsvalues.com/"
     }
-
-async def get_live_value(query):
-    query=query.strip()
-    if not query:
-        return None
-
-    aliases={
-        "dragon":["West Dragon","East Dragon"],
-        "dragon fruit":["West Dragon","East Dragon"]
-    }
-
-    for candidate in aliases.get(query.lower(),[query]):
-        slug=_slugify(candidate)
-
-        for category in ("fruits","gamepasses","limiteds","skins","perm-fruits"):
-            url=f"https://bloxfruitsvalues.com/values/{category}/{slug}"
-            try:
-                html=await _http_get(url)
-                result=_extract_live_item(html,candidate,category)
-                if result:
-                    return result
-            except Exception as exc:
-                logging.debug("Value fetch failed: %s",exc)
-
-    return None
 
 def _strip_html(value: str) -> str:
     value = re.sub(r"<script.*?</script>", " ", value, flags=re.I | re.S)
