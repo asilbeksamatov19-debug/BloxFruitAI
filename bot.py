@@ -312,7 +312,7 @@ def _slugify(name: str) -> str:
 def _extract_live_item(text, query, category):
     q=query.strip()
     m=re.search(
-        r"Regular value.*?<span[^>]*>([0-9]+(?:\\.[0-9]+)?[KMBT])</span>",
+        r"Regular value</span><div[^>]*>.*?<span[^>]*>([0-9]+(?:\\.[0-9]+)?[KMBT])</span>",
         text, re.I|re.S
     )
     if not m:
