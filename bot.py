@@ -310,31 +310,36 @@ def _slugify(name: str) -> str:
 
 
 def _extract_live_item(text, query, category):
-    marker="Regular value</span>"
-    pos=text.find(marker)
-    if pos<0:
-        return None
-    block=text[pos+len(marker):pos+1500]
-
-    m=re.search(r"<span[^>]*>([0-9]+(?:\\.[0-9]+)?[KMBT])</span>",block,re.I)
+    m=re.search(
+        r'Regular value</span><div[^>]*>.*?<span[^>]*class="[^"]*text-3xl[^"]*"[^>]*>([0-9]+(?:\.[0-9]+)?[KMBT])</span>',
+        text,re.I|re.S
+    )
     if not m:
         return None
 
-    d=re.search(r"Demand.*?([0-9]+(?:\\.[0-9]+)?)/10",text[pos:pos+8000],re.I|re.S)
+    demand_m=re.search(
+        r'>Demand\s*</span>.*?<span[^>]*>([0-9]+(?:\.[0-9]+)?)/10\s*</span>',
+        text,re.I|re.S
+    )
+    updated_m=re.search(
+        r'>Last updated\s*</span>.*?<span[^>]*>([^<]+?)\s*</span>',
+        text,re.I|re.S
+    )
+
+    start=m.start()
+    block=text[start:start+3000]
     trend="Unknown"
     for x in ("Stable","Overpaid","Underpaid","Fluctuating","Unstable"):
-        if re.search(r"\\b"+re.escape(x)+r"\\b",block,re.I):
+        if re.search(r"\b"+re.escape(x)+r"\b",block,re.I):
             trend=x
             break
-
-    u=re.search(r"(?:Last updated|Updated).*?([0-9]+\\s+(?:minutes?|hours?|days?|weeks?|months?)\\s+ago)",text[pos:pos+8000],re.I|re.S)
 
     return {
         "name":query,
         "value":m.group(1).upper(),
-        "demand":float(d.group(1)) if d else "N/A",
+        "demand":float(demand_m.group(1)) if demand_m else "N/A",
         "trend":trend,
-        "updated_at":u.group(1) if u else "Unknown",
+        "updated_at":updated_m.group(1).strip() if updated_m else "Unknown",
         "category":category,
         "source":"https://bloxfruitsvalues.com/"
     }
