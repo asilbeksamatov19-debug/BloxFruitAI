@@ -309,83 +309,35 @@ def _slugify(name: str) -> str:
     return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", name.lower())).strip("-")
 
 
-def _extract_live_item(text: str, query: str, category: str):
-    q = query.lower().strip()
-    pos = text.lower().find(q)
-    if pos < 0:
-        return None
+def _extract_live_item(text, query, category):
+    pos=text.lower().find(query.lower().strip())
+    if pos<0: return None
+    w=text[pos:pos+1200]
+    m=re.search(r"\b(\d+(?:\.\d+)?[KMBT])\b",w,re.I)
+    if not m: return None
+    d=re.search(r"Demand\s+(\d+(?:\.\d+)?)/10",w,re.I)
+    trend="Unknown"
+    for x in ("Stable","Overpaid","Underpaid","Fluctuating","Unstable"):
+        if re.search(r"\b"+x+r"\b",w,re.I): trend=x; break
+    u=re.search(r"Updated\s+(.{1,40}?)(?=\s+(?:Price history|$))",w,re.I)
+    return {"name":query,"value":m.group(1).upper(),"demand":float(d.group(1)) if d else "N/A","trend":trend,"updated_at":u.group(1).strip() if u else "Unknown","category":category,"source":"https://bloxfruitsvalues.com/"}
 
-    window = text[pos:pos + 1200]
-    value = None
-
-    m = re.search(r"\\b(\\d+(?:\\.\\d+)?[KMBT])\\b", window, re.I)
-    if m:
-        value = m.group(1).upper()
-
-    demand = None
-    m = re.search(r"Demand\\s+(\\d+(?:\\.\\d+)?)/10", window, re.I)
-    if m:
-        demand = float(m.group(1))
-
-    trend = "Unknown"
-    for candidate in ("Stable", "Overpaid", "Underpaid", "Fluctuating", "Unstable"):
-        if re.search(r"\\b" + re.escape(candidate) + r"\\b", window, re.I):
-            trend = candidate
-            break
-
-    updated = "Unknown"
-    m = re.search(r"Updated\\s+(.{1,35}?)(?=\\s+(?:Mythical|Legendary|Rare|Uncommon|Common)\\s+|$)", window, re.I)
-    if m:
-        updated = re.sub(r"\\s+", " ", m.group(1)).strip()
-
-    if not value:
-        return None
-
-    return {
-        "name": query,
-        "value": value,
-        "demand": demand if demand is not None else "N/A",
-        "trend": trend,
-        "updated_at": updated,
-        "category": category,
-        "source": "https://bloxfruitsvalues.com/",
-    }
-
-
-async def get_live_value(query: str) -> Optional[dict]:
-    query = query.strip()
-    if not query:
-        return None
-
-    aliases = {
-        "dragon": ["West Dragon", "East Dragon"],
-        "dragon fruit": ["West Dragon", "East Dragon"],
-    }
-
-    candidates = aliases.get(query.lower(), [query])
-    categories = ("fruits", "gamepasses", "limiteds")
-
-    for candidate in candidates:
-        slug = _slugify(candidate)
-
-        for category in categories:
-            urls = [
-                f"https://bloxfruitsvalues.com/values/{category}/{slug}",
-                f"https://bloxfruitsvalues.com/values/{category}",
-            ]
-
-            for url in urls:
+async def get_live_value(query):
+    query=query.strip()
+    if not query: return None
+    aliases={"dragon":["West Dragon","East Dragon"],"dragon fruit":["West Dragon","East Dragon"]}
+    for candidate in aliases.get(query.lower(),[query]):
+        slug=_slugify(candidate)
+        for category in ("fruits","gamepasses","limiteds"):
+            for url in (f"https://bloxfruitsvalues.com/values/{category}/{slug}",f"https://bloxfruitsvalues.com/values/{category}"):
                 try:
-                    html = await asyncio.to_thread(_http_get, url)
-                    text = _page_text(html)
-
+                    html=await asyncio.to_thread(_http_get,url)
+                    text=_page_text(html)
                     if candidate.lower() in text.lower():
-                        result = _extract_live_item(text, candidate, category)
-                        if result:
-                            return result
+                        r=_extract_live_item(text,candidate,category)
+                        if r: return r
                 except Exception as exc:
-                    logging.debug("Live value fetch failed %s: %s", url, exc)
-
+                    logging.debug("Live value fetch failed %s: %s",url,exc)
     return None
 
 def _strip_html(value: str) -> str:
