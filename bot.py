@@ -311,7 +311,7 @@ def _slugify(name: str) -> str:
 
 def _extract_live_item(text, query, category):
     m=re.search(
-        r'(?:Regular value|Value)</span>.*?<span[^>]*class="[^"]*text-3xl[^"]*"[^>]*>([0-9]+(?:\.[0-9]+)?[KMBT])\s*</span>',
+        r'(?:Regular value|Value)</span>.*?<span[^>]*class="[^"]*text-3xl[^"]*"[^>]*>([0-9]+(?:\.[0-9]+)?[KMBT]|N/A)\s*</span>',
         text,re.I|re.S
     )
     if not m:
@@ -352,6 +352,8 @@ async def get_live_value(query: str):
     aliases={
         "dragon":["West Dragon","East Dragon"],
         "dragon fruit":["West Dragon","East Dragon"],
+        "perm dragon":["Permanent Dragon Token"],
+        "permanent dragon":["Permanent Dragon Token"],
     }
 
     q=query.lower()
